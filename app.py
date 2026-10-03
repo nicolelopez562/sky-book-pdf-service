@@ -1,12 +1,8 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v2)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v3)
 ====================================================================
-Memory-efficient version: processes one page image at a time,
-saves each to a temp file on disk immediately, then assembles the
-final PDF from those files at the end.
-
-Includes a TEMPORARY /download endpoint for visual testing only —
-remove it once real permanent storage is wired up.
+Memory-efficient version that uploads the finished PDF to
+Cloudflare R2 for permanent storage, returning a real, public URL.
 ====================================================================
 """
 
@@ -18,6 +14,31 @@ import os
 import uuid
 import shutil
 import img2pdf
+import boto3
+from botocore.config import Config
+
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL")
+
+_r2_client = None
+
+
+def get_r2_client():
+    global _r2_client
+    if _r2_client is None:
+        _r2_client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name="auto",
+        )
+    return _r2_client
+
 
 app = Flask(__name__)
 
@@ -106,6 +127,17 @@ OVERLAY_MAP = {
 }
 
 
+def upload_pdf_to_r2(pdf_path, filename):
+    client = get_r2_client()
+    client.upload_file(
+        pdf_path,
+        R2_BUCKET_NAME,
+        filename,
+        ExtraArgs={"ContentType": "application/pdf"},
+    )
+    return f"{R2_PUBLIC_URL}/{filename}"
+
+
 @app.route("/generate-pdf", methods=["POST"])
 def generate_pdf():
     data = request.get_json()
@@ -139,11 +171,10 @@ def generate_pdf():
         with open(output_path, "wb") as f:
             f.write(img2pdf.convert(page_paths))
 
+        pdf_url = upload_pdf_to_r2(output_path, output_filename)
+
         return jsonify({
-            # TEMPORARY, for visual testing only — remove this
-            # download_url field once real permanent storage is
-            # wired up. The file only exists until Render restarts.
-            "download_url": f"/download/{output_filename}",
+            "pdf_url": pdf_url,
             "pages_rendered": len(page_paths),
         })
 
@@ -153,10 +184,6 @@ def generate_pdf():
 
 @app.route("/download/<filename>", methods=["GET"])
 def download(filename):
-    # TEMPORARY, for visual testing only — serves a PDF straight
-    # out of /tmp so it can actually be downloaded and looked at.
-    # Only works until the server restarts, since /tmp isn't
-    # permanent. Remove once real storage is wired up.
     path = os.path.join("/tmp", filename)
     if not os.path.exists(path):
         return jsonify({"error": "File not found — the server may have restarted since it was generated. Re-run /generate-pdf."}), 404
