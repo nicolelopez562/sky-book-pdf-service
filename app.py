@@ -3,13 +3,14 @@ THE SKY THAT MADE YOU — Book PDF Assembly Service (v2)
 ====================================================================
 Memory-efficient version: processes one page image at a time,
 saves each to a temp file on disk immediately, then assembles the
-final PDF from those files at the end. This avoids holding all 26
-full-resolution images in memory simultaneously, which was crashing
-the free-tier server (out of memory) in the first version.
+final PDF from those files at the end.
+
+Includes a TEMPORARY /download endpoint for visual testing only —
+remove it once real permanent storage is wired up.
 ====================================================================
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from io import BytesIO
@@ -139,12 +140,27 @@ def generate_pdf():
             f.write(img2pdf.convert(page_paths))
 
         return jsonify({
-            "pdf_url": f"PLACEHOLDER — upload {output_filename} to permanent storage and return its real URL here",
+            # TEMPORARY, for visual testing only — remove this
+            # download_url field once real permanent storage is
+            # wired up. The file only exists until Render restarts.
+            "download_url": f"/download/{output_filename}",
             "pages_rendered": len(page_paths),
         })
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@app.route("/download/<filename>", methods=["GET"])
+def download(filename):
+    # TEMPORARY, for visual testing only — serves a PDF straight
+    # out of /tmp so it can actually be downloaded and looked at.
+    # Only works until the server restarts, since /tmp isn't
+    # permanent. Remove once real storage is wired up.
+    path = os.path.join("/tmp", filename)
+    if not os.path.exists(path):
+        return jsonify({"error": "File not found — the server may have restarted since it was generated. Re-run /generate-pdf."}), 404
+    return send_file(path, mimetype="application/pdf", as_attachment=True, download_name=filename)
 
 
 @app.route("/health", methods=["GET"])
