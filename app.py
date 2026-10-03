@@ -53,12 +53,69 @@ NAVY = (20, 38, 83)
 CORAL = (230, 126, 90)
 
 
+# --------------------------------------------------------------------
+# TEXT OVERLAYS
+# --------------------------------------------------------------------
+# All positions are in pixels on the 2000 x 2000 page.
+#   x      = horizontal centre of the blank (or left edge, for left-aligned text)
+#   y      = vertical centre of the blank / icon the text sits in
+#   size   = starting font size; text shrinks automatically if it is
+#            wider than max_w, so long names and cities never spill out
+#   max_w  = widest the text is allowed to be
+# To nudge something: bigger x moves right, bigger y moves down.
+
+WELCOME_NAME = {"x": 1000, "baseline": 405, "size": 190, "max_w": 1500}
+
+BIRTHDAY_DOB = {"x": 1000, "y": 298, "size": 96, "max_w": 1120}
+BIRTHDAY_TOB = {"x": 1083, "y": 518, "size": 72, "max_w": 300}
+BIRTHDAY_CITY = {"x": 1018, "y": 612, "size": 70, "max_w": 640}
+
+# The three pills on this page are not lined up with each other,
+# so each one has its own centre. Here y is the exact middle of the
+# pill, and each sign is centred on its own letter shapes (so a word
+# with a tail, like Virgo, sits evenly between top and bottom).
+MAGIC_SUN = {"x": 1280, "y": 947, "size": 68, "max_w": 385}
+MAGIC_MOON = {"x": 1247, "y": 1059, "size": 68, "max_w": 385}
+MAGIC_RISING = {"x": 1356, "y": 1172, "size": 68, "max_w": 385}
+
+# Left-aligned, starting just right of the heart / moon / star icons.
+SUPERPOWER_LEFT_X = 580
+SUPERPOWER_SIZE = 76
+SUPERPOWER_MAX_W = 1100
+SUPERPOWER_SUN_Y = 930
+SUPERPOWER_MOON_Y = 1046
+SUPERPOWER_RISING_Y = 1176
+
+# The name sits above "A story written in the stars", as a headline.
+FINAL_NAME = {"x": 986, "baseline": 1425, "size": 180, "max_w": 1200}
+
+MIN_FONT_SIZE = 28
+
+
 def load_font(path, size):
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception as e:
-        print(f"FONT LOAD FAILED for '{path}': {e}")
-        return ImageFont.load_default()
+    # Fail loudly if a font file is missing. A silent fallback to
+    # Pillow's default font would produce a book that looks wrong
+    # and still gets sent to print.
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Font file not found: {path}")
+    return ImageFont.truetype(path, size)
+
+
+def fit_font(path, text, size, max_w):
+    """Largest font at or below `size` that keeps `text` within max_w."""
+    font = load_font(path, size)
+    while size > MIN_FONT_SIZE and font.getlength(text) > max_w:
+        size -= 2
+        font = load_font(path, size)
+    return font
+
+
+def cap_height(font):
+    return -font.getbbox("H", anchor="ls")[1]
+
+
+def clean(value):
+    return str(value or "").strip()
 
 
 def fetch_image(url):
@@ -70,53 +127,86 @@ def fetch_image(url):
     return img
 
 
-def draw_centered_text(draw, text, center_x, center_y, font, fill=PURPLE):
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    draw.text((center_x - text_w / 2, center_y - text_h / 2), text, font=font, fill=fill)
+def draw_on_baseline(draw, text, x, baseline, font, fill, align="center"):
+    """Draw text sitting on a fixed baseline. Because the baseline is
+    fixed, letters with tails (g, y, p) or tall strokes never push the
+    text up or down from one book to the next."""
+    anchor = "ms" if align == "center" else "ls"
+    draw.text((x, baseline), text, font=font, fill=fill, anchor=anchor)
+
+
+def draw_in_blank(draw, text, spot, font_path, fill, align="center",
+                  centre_on="capitals"):
+    """Draw text vertically centred on spot['y'] (the middle of a pill,
+    blank or icon), shrinking it if needed to fit spot['max_w'].
+
+    centre_on="capitals": every line sits on the same baseline, lined
+        up with the printed sentence around it.
+    centre_on="letters":  the word's actual shapes (tails included)
+        are centred, so it looks evenly spaced inside a visible pill.
+    """
+    text = clean(text)
+    if not text:
+        return
+    font = fit_font(font_path, text, spot["size"], spot["max_w"])
+    if centre_on == "letters":
+        _, top, _, bottom = font.getbbox(text, anchor="ls")
+        baseline = spot["y"] - (top + bottom) / 2
+    else:
+        baseline = spot["y"] + cap_height(font) / 2
+    draw_on_baseline(draw, text, spot["x"], baseline, font, fill, align)
+
+
+def draw_name(draw, text, spot, fill=PURPLE):
+    text = clean(text)
+    if not text:
+        return
+    font = fit_font(FONT_HEADLINE, text, spot["size"], spot["max_w"])
+    draw_on_baseline(draw, text, spot["x"], spot["baseline"], font, fill)
 
 
 def overlay_welcome(img, data):
     draw = ImageDraw.Draw(img)
-    font = load_font(FONT_HEADLINE, 160)
-    draw_centered_text(draw, data["childName"], center_x=820, center_y=330, font=font)
+    draw_name(draw, data["childName"], WELCOME_NAME)
     return img
 
 
 def overlay_birthday(img, data):
     draw = ImageDraw.Draw(img)
-    font = load_font(FONT_BODY, 56)
-    draw_centered_text(draw, data["dobDisplay"], center_x=1000, center_y=250, font=font)
-    draw_centered_text(draw, data["tobDisplay"], center_x=1360, center_y=640, font=font)
-    draw_centered_text(draw, data["city"], center_x=1360, center_y=760, font=font)
+    draw_in_blank(draw, data["dobDisplay"], BIRTHDAY_DOB, FONT_BODY, PURPLE)
+    draw_in_blank(draw, data["tobDisplay"], BIRTHDAY_TOB, FONT_BODY, PURPLE)
+    draw_in_blank(draw, data["city"], BIRTHDAY_CITY, FONT_BODY, PURPLE)
     return img
 
 
 def overlay_magic_of_you(img, data):
     draw = ImageDraw.Draw(img)
-    font = load_font(FONT_BODY, 60)
-    pill_center_x = 1300
-    draw_centered_text(draw, data["sunSign"], center_x=pill_center_x, center_y=950, font=font, fill=NAVY)
-    draw_centered_text(draw, data["moonSign"], center_x=pill_center_x, center_y=1060, font=font, fill=NAVY)
-    draw_centered_text(draw, data["risingSign"], center_x=pill_center_x, center_y=1170, font=font, fill=NAVY)
+    draw_in_blank(draw, data["sunSign"], MAGIC_SUN, FONT_BODY, NAVY,
+                  centre_on="letters")
+    draw_in_blank(draw, data["moonSign"], MAGIC_MOON, FONT_BODY, NAVY,
+                  centre_on="letters")
+    draw_in_blank(draw, data["risingSign"], MAGIC_RISING, FONT_BODY, NAVY,
+                  centre_on="letters")
     return img
 
 
 def overlay_superpowers(img, data):
     draw = ImageDraw.Draw(img)
-    font = load_font(FONT_BODY, 50)
-    text_left_x = 760
-    draw.text((text_left_x, 820), data["sunSuperpower"], font=font, fill=NAVY)
-    draw.text((text_left_x, 920), data["moonSuperpower"], font=font, fill=PURPLE)
-    draw.text((text_left_x, 1020), data["risingSuperpower"], font=font, fill=CORAL)
+    rows = [
+        (data["sunSuperpower"], SUPERPOWER_SUN_Y, NAVY),
+        (data["moonSuperpower"], SUPERPOWER_MOON_Y, PURPLE),
+        (data["risingSuperpower"], SUPERPOWER_RISING_Y, CORAL),
+    ]
+    for text, y, colour in rows:
+        spot = {"x": SUPERPOWER_LEFT_X, "y": y,
+                "size": SUPERPOWER_SIZE, "max_w": SUPERPOWER_MAX_W}
+        draw_in_blank(draw, text, spot, FONT_BODY, colour, align="left")
     return img
 
 
 def overlay_final_page(img, data):
     draw = ImageDraw.Draw(img)
-    font = load_font(FONT_HEADLINE, 100)
-    draw_centered_text(draw, data["childName"], center_x=1000, center_y=1700, font=font)
+    draw_name(draw, data["childName"], FINAL_NAME)
     return img
 
 
