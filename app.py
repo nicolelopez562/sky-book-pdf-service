@@ -56,7 +56,8 @@ CORAL = (230, 126, 90)
 def load_font(path, size):
     try:
         return ImageFont.truetype(path, size)
-    except Exception:
+    except Exception as e:
+        print(f"FONT LOAD FAILED for '{path}': {e}")
         return ImageFont.load_default()
 
 
@@ -86,6 +87,7 @@ def overlay_welcome(img, data):
 def overlay_birthday(img, data):
     draw = ImageDraw.Draw(img)
     font = load_font(FONT_BODY, 56)
+    draw_centered_text(draw, data["dobDisplay"], center_x=1000, center_y=250, font=font)
     draw_centered_text(draw, data["tobDisplay"], center_x=1360, center_y=640, font=font)
     draw_centered_text(draw, data["city"], center_x=1360, center_y=760, font=font)
     return img
