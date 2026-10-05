@@ -4,3 +4,6 @@ requests==2.32.3
 gunicorn==22.0.0
 img2pdf==0.5.1
 boto3==1.35.0
+pypdf==6.19.0
+reportlab==5.0.1
+uharfbuzz==0.56.2
