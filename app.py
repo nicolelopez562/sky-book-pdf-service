@@ -102,7 +102,7 @@ SUPERPOWER_SIZE = 76
 SUPERPOWER_MAX_W = 1100
 SUPERPOWER_SUN_Y = 930
 SUPERPOWER_MOON_Y = 1046
-SUPERPOWER_RISING_Y = 1176
+SUPERPOWER_RISING_Y = 1166
 
 # The name sits above "A story written in the stars", as a headline.
 FINAL_NAME = {"x": 986, "baseline": 1425, "size": 180, "max_w": 1200}
