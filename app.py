@@ -1,5 +1,5 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v5)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v6)
 ====================================================================
 Memory-efficient version that uploads the finished PDF to
 Cloudflare R2 for permanent storage, returning a real, public URL.
@@ -13,6 +13,10 @@ What it makes:
                    then posts both file links to a Zapier "catch hook".
                    (Zapier gives up on a step after about 30 seconds,
                    which is not long enough to build a whole book.)
+                   When the last book of an order is built, the whole
+                   order is sent to Lulu as one print job (one box).
+  /send-order      sends an order that was held back (for example a
+                   book whose birth place needed checking) to Lulu.
 ====================================================================
 """
 
@@ -25,6 +29,9 @@ import uuid
 import shutil
 import time
 import json
+import base64
+import hashlib
+import hmac
 import threading
 import unicodedata
 import img2pdf
@@ -574,7 +581,228 @@ def run_build(job):
     if notes:
         result["status"] = "error"
         result["filesNote"] = " | ".join(notes)
+    result["luluJobId"] = ""
+    result["notionStatus"] = "Needs attention" if notes else ""
     post_callback(job["callbackUrl"], result)
+
+    # Remember this book, then send the order to Lulu if it was the last one.
+    order_name = job.get("orderName")
+    if not order_name or notes:
+        return
+    try:
+        save_record(order_prefix(order_name) + f"book-{job['bookNumber']}.json", {
+            "bookNumber": job["bookNumber"], "printCount": job["printCount"],
+            "quantity": job["quantity"], "status": job["bookStatus"],
+            "childName": job["childName"], "coverId": job["coverId"],
+            "notionPageId": job["notionPageId"], "orderLabel": job["orderLabel"],
+            "interiorPdfUrl": result["interiorPdfUrl"], "coverPdfUrl": result["coverPdfUrl"],
+            "interiorPages": result["interiorPages"], "ship": job["ship"],
+            "callbackUrl": job["callbackUrl"]})
+        send_order(order_name, job["ship"], job["callbackUrl"])
+    except Exception as e:  # noqa: BLE001
+        app.logger.exception("Could not record or send order %s", order_name)
+        result["filesNote"] = "Files ready, but the order could not be sent to Lulu: " + _short(e)
+        result["notionStatus"] = "Needs attention"
+        post_callback(job["callbackUrl"], result)
+
+
+# --------------------------------------------------------------------
+# LULU — one print job per order
+# --------------------------------------------------------------------
+# Settings (Render > Environment). Nothing is sent to Lulu until both
+# LULU_CLIENT_KEY and LULU_CLIENT_SECRET are set. LULU_ENV stays
+# "sandbox" (test orders, never printed or charged) until it is changed
+# to "production".
+LULU_CLIENT_KEY = os.environ.get("LULU_CLIENT_KEY", "")
+LULU_CLIENT_SECRET = os.environ.get("LULU_CLIENT_SECRET", "")
+LULU_ENV = os.environ.get("LULU_ENV", "sandbox").strip().lower()
+LULU_BASE = "https://api.lulu.com" if LULU_ENV == "production" else "https://api.sandbox.lulu.com"
+LULU_POD_PACKAGE_ID = os.environ.get("LULU_POD_PACKAGE_ID", "0850X0850.FC.PRE.CW.080CW444.GXX")
+LULU_CONTACT_EMAIL = os.environ.get("LULU_CONTACT_EMAIL", "hello@theskythatmadeyou.com")
+LULU_DEFAULT_PHONE = os.environ.get("LULU_DEFAULT_PHONE", "")
+# Minutes Lulu waits before printing, so a job can still be stopped.
+LULU_PRODUCTION_DELAY = int(os.environ.get("LULU_PRODUCTION_DELAY", "1440"))
+# Shopify shipping option name -> Lulu shipping level.
+LULU_SHIPPING_MAP = json.loads(os.environ.get("LULU_SHIPPING_MAP", '{"Standard": "GROUND"}'))
+LULU_DEFAULT_SHIPPING = os.environ.get("LULU_DEFAULT_SHIPPING", "GROUND")
+BOOK_TITLE = "The Sky That Made You"
+READY_STATUS = "Signs calculated"
+
+_lulu_token = {"value": "", "expires": 0.0}
+ORDER_LOCK = threading.Lock()
+
+
+def lulu_enabled():
+    return bool(LULU_CLIENT_KEY and LULU_CLIENT_SECRET)
+
+
+def lulu_token():
+    if _lulu_token["value"] and time.time() < _lulu_token["expires"] - 60:
+        return _lulu_token["value"]
+    basic = base64.b64encode(f"{LULU_CLIENT_KEY}:{LULU_CLIENT_SECRET}".encode()).decode()
+    r = requests.post(
+        f"{LULU_BASE}/auth/realms/glasstree/protocol/openid-connect/token",
+        headers={"Authorization": f"Basic {basic}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "client_credentials"}, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Lulu sign-in failed (status {r.status_code}): {r.text[:200]}")
+    body = r.json()
+    _lulu_token["value"] = body["access_token"]
+    _lulu_token["expires"] = time.time() + float(body.get("expires_in", 300))
+    return _lulu_token["value"]
+
+
+def order_prefix(order_name):
+    """Storage folder for an order's records. Not guessable without the
+    server's secret, because the records include the shipping address."""
+    key = (BUILD_SECRET or LULU_CLIENT_SECRET or "sky").encode()
+    tag = hmac.new(key, order_name.encode(), hashlib.sha256).hexdigest()[:24]
+    digits = "".join(ch for ch in order_name if ch.isalnum()) or "order"
+    return f"orders/{digits}-{tag}/"
+
+
+def save_record(key, data):
+    get_r2_client().put_object(Bucket=R2_BUCKET_NAME, Key=key,
+                               Body=json.dumps(data).encode(), ContentType="application/json")
+
+
+def load_record(key):
+    try:
+        obj = get_r2_client().get_object(Bucket=R2_BUCKET_NAME, Key=key)
+        return json.loads(obj["Body"].read())
+    except Exception:  # noqa: BLE001 - "not there yet"
+        return None
+
+
+def order_books(order_name):
+    prefix = order_prefix(order_name)
+    out = []
+    listing = get_r2_client().list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix + "book-")
+    for item in listing.get("Contents", []):
+        rec = load_record(item["Key"])
+        if rec:
+            out.append(rec)
+    return sorted(out, key=lambda b: b.get("bookNumber", 0))
+
+
+def lulu_shipping_level(method):
+    return LULU_SHIPPING_MAP.get(clean(method), LULU_DEFAULT_SHIPPING)
+
+
+def create_lulu_job(order_name, books, ship):
+    """One print job for the whole order. Returns Lulu's reply."""
+    phone = clean(ship.get("phone")) or LULU_DEFAULT_PHONE
+    address = {
+        "name": clean(ship.get("name")),
+        "street1": clean(ship.get("street1")),
+        "street2": clean(ship.get("street2")),
+        "city": clean(ship.get("city")),
+        "state_code": clean(ship.get("stateCode")),
+        "postcode": clean(ship.get("postcode")),
+        "country_code": clean(ship.get("countryCode")).upper() or "US",
+        "phone_number": phone,
+        "email": clean(ship.get("email")),
+    }
+    address = {k: v for k, v in address.items() if v}
+    missing = [k for k in ("name", "street1", "city", "postcode", "phone_number") if k not in address]
+    if missing:
+        raise RuntimeError("Shipping address is missing: " + ", ".join(missing))
+    body = {
+        "external_id": order_name,
+        "contact_email": LULU_CONTACT_EMAIL,
+        "shipping_level": lulu_shipping_level(ship.get("method")),
+        "production_delay": LULU_PRODUCTION_DELAY,
+        "shipping_address": address,
+        "line_items": [{
+            "external_id": f"{order_name} book {b['bookNumber']}",
+            "title": f"{BOOK_TITLE} - {b['childName']}",
+            "quantity": int(b.get("quantity") or 1),
+            "printable_normalization": {
+                "pod_package_id": LULU_POD_PACKAGE_ID,
+                "interior": {"source_url": b["interiorPdfUrl"]},
+                "cover": {"source_url": b["coverPdfUrl"]},
+            },
+        } for b in books],
+    }
+    r = requests.post(f"{LULU_BASE}/print-jobs/",
+                      headers={"Authorization": f"Bearer {lulu_token()}",
+                               "Content-Type": "application/json"},
+                      json=body, timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Lulu refused the print job (status {r.status_code}): {r.text[:400]}")
+    return r.json()
+
+
+def lulu_job_status(reply):
+    status = reply.get("status")
+    if isinstance(status, dict):
+        return clean(status.get("name"))
+    return clean(status)
+
+
+def send_order(order_name, ship, callback_url, force=False):
+    """Sends the order to Lulu if every book is built, then tells Notion
+    about every book on the order. Safe to call more than once."""
+    prefix = order_prefix(order_name)
+    with ORDER_LOCK:
+        sent = load_record(prefix + "lulu.json")
+        books = order_books(order_name)
+        expected = max([int(b.get("printCount") or 0) for b in books] or [0])
+        if sent:
+            return {"state": "already_sent", "luluJobId": sent.get("luluJobId", "")}
+        if not books:
+            return {"state": "waiting", "built": 0, "expected": expected}
+        if expected and len(books) < expected:
+            return {"state": "waiting", "built": len(books), "expected": expected}
+        flagged = [b for b in books if clean(b.get("status")) not in ("", READY_STATUS)]
+        failed = [b for b in books if not (b.get("interiorPdfUrl") and b.get("coverPdfUrl"))]
+        if expected == 0:
+            note = "Not sent to Lulu: the Zap did not say how many books are on this order (printCount)."
+            result = {"state": "held", "note": note}
+        elif failed:
+            note = "Not sent to Lulu: a book on this order has no files."
+            result = {"state": "held", "note": note}
+        elif flagged and not force:
+            names = ", ".join(b["childName"] for b in flagged)
+            note = (f"Not sent to Lulu yet: check the place of birth for {names}, "
+                    f"then send the order with /send-order.")
+            result = {"state": "held", "note": note}
+        elif not lulu_enabled():
+            note = "Files ready. Not sent to Lulu: Lulu keys are not set on the server."
+            result = {"state": "held", "note": note}
+        else:
+            try:
+                reply = create_lulu_job(order_name, books, ship)
+                job_id = str(reply.get("id", ""))
+                save_record(prefix + "lulu.json", {
+                    "luluJobId": job_id, "env": LULU_ENV, "sentAt": int(time.time()),
+                    "status": lulu_job_status(reply)})
+                where = "Lulu sandbox (test)" if LULU_ENV != "production" else "Lulu"
+                note = f"Sent to {where} as print job {job_id} with {len(books)} book(s)."
+                result = {"state": "sent", "luluJobId": job_id, "note": note}
+            except Exception as e:  # noqa: BLE001
+                app.logger.exception("Lulu send failed for %s", order_name)
+                note = "Lulu: " + _short(e)
+                result = {"state": "error", "note": note}
+
+    # Tell Notion, one message per book on the order.
+    for b in books:
+        msg = {
+            "jobId": "", "notionPageId": b.get("notionPageId", ""),
+            "orderLabel": b.get("orderLabel", ""), "childName": b.get("childName", ""),
+            "coverId": b.get("coverId", ""),
+            "interiorPdfUrl": b.get("interiorPdfUrl", ""), "coverPdfUrl": b.get("coverPdfUrl", ""),
+            "interiorPages": b.get("interiorPages", 0),
+            "status": "ok" if result["state"] == "sent" else result["state"],
+            "filesNote": result["note"],
+            "luluJobId": result.get("luluJobId", ""),
+            "notionStatus": "Sent to printer" if result["state"] == "sent"
+                            else ("Needs attention" if result["state"] == "error" else ""),
+        }
+        if callback_url:
+            post_callback(callback_url, msg)
+    return result
 
 
 @app.route("/build-book", methods=["POST"])
@@ -624,7 +852,25 @@ def build_book():
     if problems:
         return jsonify({"error": "; ".join(problems)}), 400
 
+    def as_int(name, default):
+        try:
+            return int(float(_field(data, name) or default))
+        except ValueError:
+            return default
+
     job = {
+        "orderName": _field(data, "orderName"),
+        "bookNumber": as_int("bookNumber", 1),
+        "printCount": as_int("printCount", 0),   # 0 = unknown: never send
+        "quantity": max(as_int("quantity", 1), 1),
+        "bookStatus": _field(data, "bookStatus"),
+        "ship": {
+            "name": _field(data, "shipName"), "street1": _field(data, "shipStreet1"),
+            "street2": _field(data, "shipStreet2"), "city": _field(data, "shipCity"),
+            "stateCode": _field(data, "shipStateCode"), "postcode": _field(data, "shipPostcode"),
+            "countryCode": _field(data, "shipCountryCode"), "phone": _field(data, "shipPhone"),
+            "email": _field(data, "customerEmail"), "method": _field(data, "shippingMethod"),
+        },
         "jobId": uuid.uuid4().hex[:10],
         "book": book,
         "childName": child_name,
@@ -637,6 +883,24 @@ def build_book():
     threading.Thread(target=run_build, args=(job,), daemon=True).start()
     return jsonify({"accepted": True, "jobId": job["jobId"],
                     "message": "Building in the background; the links will be sent to the callback."}), 202
+
+
+@app.route("/send-order", methods=["POST"])
+def send_order_route():
+    """Sends a held order to Lulu, e.g. after a place of birth was checked.
+    Body: {"secret": "...", "orderName": "#1009"}"""
+    data = request.get_json(silent=True) or {}
+    if BUILD_SECRET and _field(data, "secret") != BUILD_SECRET:
+        return jsonify({"error": "Wrong or missing 'secret'"}), 403
+    order_name = _field(data, "orderName")
+    if not order_name:
+        return jsonify({"error": "Missing 'orderName' (for example #1009)"}), 400
+    books = order_books(order_name)
+    if not books:
+        return jsonify({"error": f"No built books found for {order_name}"}), 404
+    last = books[-1]
+    result = send_order(order_name, last.get("ship") or {}, last.get("callbackUrl", ""), force=True)
+    return jsonify(result), 200
 
 
 @app.route("/health", methods=["GET"])
