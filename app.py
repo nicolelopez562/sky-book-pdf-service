@@ -1,5 +1,5 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.1)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.2)
 ====================================================================
 Memory-efficient version that uploads the finished PDF to
 Cloudflare R2 for permanent storage, returning a real, public URL.
@@ -701,6 +701,26 @@ def lulu_shipping_level(method):
     return LULU_SHIPPING_MAP.get(clean(method), LULU_DEFAULT_SHIPPING)
 
 
+# Shopify sometimes hands over the country's name ("United States")
+# instead of its two-letter code; Lulu only accepts the code.
+COUNTRY_NAME_TO_CODE = {
+    "united states": "US", "united states of america": "US", "usa": "US", "us": "US",
+    "u s": "US", "u s a": "US", "america": "US", "canada": "CA", "united kingdom": "GB",
+    "uk": "GB", "great britain": "GB", "england": "GB", "scotland": "GB", "wales": "GB",
+    "northern ireland": "GB", "ireland": "IE", "australia": "AU", "new zealand": "NZ",
+    "mexico": "MX", "france": "FR", "germany": "DE", "spain": "ES", "italy": "IT",
+    "netherlands": "NL", "the netherlands": "NL", "puerto rico": "PR",
+}
+
+
+def country_code(value):
+    text = clean(value)
+    if len(text) == 2 and text.isalpha():
+        return text.upper()
+    key = " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in text).split())
+    return COUNTRY_NAME_TO_CODE.get(key, text.upper() if text else "US")
+
+
 def create_lulu_job(order_name, books, ship):
     """One print job for the whole order. Returns Lulu's reply."""
     phone = clean(ship.get("phone")) or LULU_DEFAULT_PHONE
@@ -711,7 +731,7 @@ def create_lulu_job(order_name, books, ship):
         "city": clean(ship.get("city")),
         "state_code": clean(ship.get("stateCode")),
         "postcode": clean(ship.get("postcode")),
-        "country_code": clean(ship.get("countryCode")).upper() or "US",
+        "country_code": country_code(ship.get("countryCode")),
         "phone_number": phone,
         "email": clean(ship.get("email")),
     }
