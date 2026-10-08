@@ -1,5 +1,5 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.4)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.5)
 ====================================================================
 Memory-efficient version that uploads the finished PDF to
 Cloudflare R2 for permanent storage, returning a real, public URL.
@@ -32,6 +32,7 @@ import json
 import base64
 import hashlib
 import hmac
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import unicodedata
 import img2pdf
@@ -976,6 +977,91 @@ def check_settings():
         "buildSecretSet": bool(BUILD_SECRET),
         "settingsSeen": seen,
     })
+
+
+# Sample delivery addresses across the US, for shipping quotes only.
+QUOTE_PLACES = {
+    "Los Angeles, CA": {"city": "Los Angeles", "state_code": "CA", "postcode": "90012"},
+    "Seattle, WA": {"city": "Seattle", "state_code": "WA", "postcode": "98104"},
+    "Chicago, IL": {"city": "Chicago", "state_code": "IL", "postcode": "60602"},
+    "Miami, FL": {"city": "Miami", "state_code": "FL", "postcode": "33128"},
+    "New York, NY": {"city": "New York", "state_code": "NY", "postcode": "10007"},
+    "Anchorage, AK": {"city": "Anchorage", "state_code": "AK", "postcode": "99501"},
+    "Honolulu, HI": {"city": "Honolulu", "state_code": "HI", "postcode": "96813"},
+}
+INTERIOR_PAGES = 26
+
+
+def _money(value):
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def lulu_quote(quantity, level, place):
+    body = {
+        "line_items": [{"page_count": INTERIOR_PAGES, "pod_package_id": LULU_POD_PACKAGE_ID,
+                        "quantity": quantity}],
+        "shipping_address": dict(place, street1="100 Main St", country_code="US",
+                                 phone_number=LULU_DEFAULT_PHONE or "5555555555"),
+        "shipping_option": level,
+    }
+    r = requests.post(f"{LULU_BASE}/print-job-cost-calculations/",
+                      headers={"Authorization": f"Bearer {lulu_token()}",
+                               "Content-Type": "application/json"},
+                      json=body, timeout=25)
+    if r.status_code not in (200, 201):
+        return {"error": f"status {r.status_code}: {r.text[:200]}"}
+    d = r.json()
+    shipping = d.get("shipping_cost") or {}
+    fulfil = d.get("fulfillment_cost") or {}
+    books = sum(_money(li.get("total_cost_excl_tax")) or 0 for li in d.get("line_item_costs") or [])
+    return {
+        "books": round(books, 2),
+        "shipping": _money(shipping.get("total_cost_excl_tax")),
+        "fulfillment": _money(fulfil.get("total_cost_excl_tax")),
+        "total_excl_tax": _money(d.get("total_cost_excl_tax")),
+        "total_incl_tax": _money(d.get("total_cost_incl_tax")),
+    }
+
+
+@app.route("/quote", methods=["POST"])
+def quote():
+    """Asks Lulu what printing + shipping would cost, without ordering.
+    Body: {"secret": "...", "levels": ["PRIORITY_MAIL"], "quantities": [1,2,3,4,5]}"""
+    data = request.get_json(silent=True) or {}
+    if BUILD_SECRET and _field(data, "secret") != BUILD_SECRET:
+        return jsonify({"error": "Wrong or missing 'secret'"}), 403
+    if not lulu_enabled():
+        return jsonify({"error": "Lulu keys are not set on the server"}), 400
+    levels = [str(x).strip().upper() for x in (data.get("levels") or ["PRIORITY_MAIL"])][:3]
+    quantities = [int(q) for q in (data.get("quantities") or [1, 2, 3, 4, 5])][:5]
+    jobs = [(q, lv, name) for lv in levels for q in quantities for name in QUOTE_PLACES]
+    try:
+        lulu_token()
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": _short(e)}), 502
+
+    def run(job):
+        q, lv, name = job
+        try:
+            return job, lulu_quote(q, lv, QUOTE_PLACES[name])
+        except Exception as e:  # noqa: BLE001
+            return job, {"error": _short(e)}
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(run, jobs))
+
+    table, worst = {}, {}
+    for (q, lv, name), res in results:
+        table.setdefault(lv, {}).setdefault(f"{q} book(s)", {})[name] = res
+        ship = res.get("shipping")
+        if ship is not None:
+            key = f"{lv} {q} book(s)"
+            if key not in worst or ship > worst[key]["shipping"]:
+                worst[key] = {"shipping": ship, "to": name, "total_excl_tax": res.get("total_excl_tax")}
+    return jsonify({"environment": LULU_ENV, "most_expensive_shipping": worst, "all": table})
 
 
 @app.route("/health", methods=["GET"])
