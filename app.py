@@ -1,5 +1,5 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.2)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.3)
 ====================================================================
 Memory-efficient version that uploads the finished PDF to
 Cloudflare R2 for permanent storage, returning a real, public URL.
@@ -297,7 +297,14 @@ def overlay_final_page(img, data):
 #   size     = full size; longer names shrink to fit max_w
 #   max_w    = widest the name may be (the width of the moon)
 
-COVER_PAGE_SIZE = (1386.0, 738.0)          # 19.25 x 10.25 in
+# Lulu's accepted cover size for a 26-page 8.5 x 8.5 in casewrap:
+# 18.938-19.062 in wide x 10.188-10.312 in tall (in points: x 72).
+COVER_WIDTH_RANGE = (1363.5, 1372.5)
+COVER_HEIGHT_RANGE = (733.5, 742.5)
+# The name is centred this far in from the RIGHT edge (the front cover is
+# the right-hand panel, so its distance from that edge never changes when
+# the spine gets wider or narrower).
+COVER_NAME_FROM_RIGHT = 350.25
 COVER_NAME = {"x": 1035.75, "baseline": 115.03, "size": 60.57,
               "max_w": 380.0, "min_size": 24.0}
 COVER_NAME_CMYK = (0.945, 0.745, 0.027, 0.604)   # the cover's navy
@@ -347,11 +354,15 @@ def shape_cover_name(text):
     return letters, pen / upem
 
 
+def _name_spot(page_width):
+    return dict(COVER_NAME, x=page_width - COVER_NAME_FROM_RIGHT)
+
+
 def _name_slot_is_empty(page):
     """True if the chosen template page has no text where the name goes.
     Stops a name being printed on top of a leftover placeholder."""
     found = []
-    spot = COVER_NAME
+    spot = _name_spot(float(page.mediabox.width))
 
     def in_slot(x, y):
         return abs(y - spot["baseline"]) < 30 and abs(x - spot["x"]) < 320
@@ -383,17 +394,20 @@ def build_cover_pdf(template_bytes, child_name, out_path):
     page = reader.pages[-1]
 
     width, height = float(page.mediabox.width), float(page.mediabox.height)
-    if abs(width - COVER_PAGE_SIZE[0]) > 1 or abs(height - COVER_PAGE_SIZE[1]) > 1:
+    if not (COVER_WIDTH_RANGE[0] <= width <= COVER_WIDTH_RANGE[1]
+            and COVER_HEIGHT_RANGE[0] <= height <= COVER_HEIGHT_RANGE[1]):
         raise ValueError(
-            f"Cover template is {width / 72:.2f} x {height / 72:.2f} in, "
-            f"expected {COVER_PAGE_SIZE[0] / 72:.2f} x {COVER_PAGE_SIZE[1] / 72:.2f} in.")
+            f"Cover template is {width / 72:.3f} x {height / 72:.3f} in; Lulu needs "
+            f"{COVER_WIDTH_RANGE[0] / 72:.3f}-{COVER_WIDTH_RANGE[1] / 72:.3f} in wide x "
+            f"{COVER_HEIGHT_RANGE[0] / 72:.3f}-{COVER_HEIGHT_RANGE[1] / 72:.3f} in tall "
+            f"for this book. Re-export the cover at the right size.")
     if not _name_slot_is_empty(page):
         raise ValueError(
             "The cover template's last page already has a name where the child's "
             "name goes. Export the cover without the placeholder name.")
 
     letters, unit_width = shape_cover_name(name)
-    spot = COVER_NAME
+    spot = _name_spot(width)
     size = spot["size"]
     if unit_width * size > spot["max_w"]:
         size = max(spot["min_size"], spot["max_w"] / unit_width)
