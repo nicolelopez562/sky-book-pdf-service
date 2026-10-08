@@ -1,5 +1,5 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.3)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.4)
 ====================================================================
 Memory-efficient version that uploads the finished PDF to
 Cloudflare R2 for permanent storage, returning a real, public URL.
@@ -711,8 +711,13 @@ def order_books(order_name):
     return sorted(out, key=lambda b: b.get("bookNumber", 0))
 
 
-def lulu_shipping_level(method):
-    return LULU_SHIPPING_MAP.get(clean(method), LULU_DEFAULT_SHIPPING)
+def lulu_shipping_level(method, country="US"):
+    level = LULU_SHIPPING_MAP.get(clean(method), LULU_DEFAULT_SHIPPING).strip().upper()
+    # Inside the US, Lulu's ground service is GROUND_HD (home delivery);
+    # plain GROUND is only accepted for addresses outside the US.
+    if level == "GROUND" and country == "US":
+        level = "GROUND_HD"
+    return level
 
 
 # Shopify sometimes hands over the country's name ("United States")
@@ -756,7 +761,7 @@ def create_lulu_job(order_name, books, ship):
     body = {
         "external_id": order_name,
         "contact_email": LULU_CONTACT_EMAIL,
-        "shipping_level": lulu_shipping_level(ship.get("method")),
+        "shipping_level": lulu_shipping_level(ship.get("method"), address["country_code"]),
         "production_delay": LULU_PRODUCTION_DELAY,
         "shipping_address": address,
         "line_items": [{
@@ -786,7 +791,7 @@ def lulu_job_status(reply):
     return clean(status)
 
 
-def send_order(order_name, ship, callback_url, force=False):
+def send_order(order_name, ship, callback_url, force=False, resend=False):
     """Sends the order to Lulu if every book is built, then tells Notion
     about every book on the order. Safe to call more than once."""
     prefix = order_prefix(order_name)
@@ -794,7 +799,7 @@ def send_order(order_name, ship, callback_url, force=False):
         sent = load_record(prefix + "lulu.json")
         books = order_books(order_name)
         expected = max([int(b.get("printCount") or 0) for b in books] or [0])
-        if sent:
+        if sent and not resend:
             return {"state": "already_sent", "luluJobId": sent.get("luluJobId", "")}
         if not books:
             return {"state": "waiting", "built": 0, "expected": expected}
@@ -933,7 +938,9 @@ def build_book():
 @app.route("/send-order", methods=["POST"])
 def send_order_route():
     """Sends a held order to Lulu, e.g. after a place of birth was checked.
-    Body: {"secret": "...", "orderName": "#1009"}"""
+    Body: {"secret": "...", "orderName": "#1009"}
+    Add "resend": true to send it again after Lulu rejected the first job
+    (check first that the earlier job really was rejected or cancelled)."""
     data = request.get_json(silent=True) or {}
     if BUILD_SECRET and _field(data, "secret") != BUILD_SECRET:
         return jsonify({"error": "Wrong or missing 'secret'"}), 403
@@ -944,7 +951,9 @@ def send_order_route():
     if not books:
         return jsonify({"error": f"No built books found for {order_name}"}), 404
     last = books[-1]
-    result = send_order(order_name, last.get("ship") or {}, last.get("callbackUrl", ""), force=True)
+    resend = str(data.get("resend", "")).strip().lower() in ("true", "1", "yes")
+    result = send_order(order_name, last.get("ship") or {}, last.get("callbackUrl", ""),
+                        force=True, resend=resend)
     return jsonify(result), 200
 
 
