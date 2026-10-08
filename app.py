@@ -1,17 +1,22 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v4)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v5)
 ====================================================================
 Memory-efficient version that uploads the finished PDF to
 Cloudflare R2 for permanent storage, returning a real, public URL.
 
-Two things it makes:
-  /generate-pdf    the 26-page inside of the book
+What it makes:
+  /generate-pdf    the 26-page inside of the book (waits until done)
   /generate-cover  the printed cover (back, spine, front) with the
-                   child's name stamped on the front
+                   child's name stamped on the front (waits until done)
+  /build-book      both of the above for one book, for Zapier: it
+                   answers straight away, builds in the background,
+                   then posts both file links to a Zapier "catch hook".
+                   (Zapier gives up on a step after about 30 seconds,
+                   which is not long enough to build a whole book.)
 ====================================================================
 """
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from io import BytesIO
@@ -19,6 +24,8 @@ import os
 import uuid
 import shutil
 import time
+import json
+import threading
 import unicodedata
 import img2pdf
 import boto3
@@ -83,6 +90,9 @@ CORAL = (230, 126, 90)
 # To nudge something: bigger x moves right, bigger y moves down.
 
 WELCOME_NAME = {"x": 1000, "baseline": 405, "size": 190, "max_w": 1500}
+# The Welcome page speaks to the child ("Justine, the day you were
+# born..."), so the name is followed by a comma. Set to False to drop it.
+WELCOME_NAME_COMMA = False
 
 BIRTHDAY_DOB = {"x": 1000, "y": 298, "size": 96, "max_w": 1120}
 BIRTHDAY_TOB = {"x": 1083, "y": 518, "size": 72, "max_w": 300}
@@ -201,7 +211,17 @@ def draw_name(draw, text, spot, fill=PURPLE):
 
 def overlay_welcome(img, data):
     draw = ImageDraw.Draw(img)
-    draw_name(draw, data["childName"], WELCOME_NAME)
+    name = clean(data["childName"])
+    if not name:
+        return img
+    if not WELCOME_NAME_COMMA:
+        draw_name(draw, name, WELCOME_NAME)
+        return img
+    spot = WELCOME_NAME
+    font = fit_font(FONT_HEADLINE, name + ",", spot["size"], spot["max_w"])
+    # Keep the name itself centred on the page; the comma hangs to its right.
+    left = spot["x"] - font.getlength(name) / 2
+    draw_on_baseline(draw, name + ",", left, spot["baseline"], font, PURPLE, align="left")
     return img
 
 
@@ -401,17 +421,13 @@ def upload_pdf_to_r2(pdf_path, filename):
     return f"{R2_PUBLIC_URL}/{filename}"
 
 
-@app.route("/generate-pdf", methods=["POST"])
-def generate_pdf():
-    data = request.get_json()
-
-    if not data or "pages" not in data:
-        return jsonify({"error": "Missing 'pages' in request body"}), 400
-
+def make_interior(data):
+    """Builds the 26-page inside of the book and uploads it. Returns its details."""
     job_id = uuid.uuid4().hex[:10]
     temp_dir = os.path.join("/tmp", f"job-{job_id}")
     os.makedirs(temp_dir, exist_ok=True)
-
+    output_filename = f"book-{job_id}.pdf"
+    output_path = os.path.join("/tmp", output_filename)
     page_paths = []
 
     try:
@@ -428,23 +444,43 @@ def generate_pdf():
             img.close()
             del img
 
-        output_filename = f"book-{job_id}.pdf"
-        output_path = os.path.join("/tmp", output_filename)
-
         page_pt = img2pdf.in_to_pt(PAGE_INCHES)
         layout = img2pdf.get_layout_fun((page_pt, page_pt))
         with open(output_path, "wb") as f:
             f.write(img2pdf.convert(page_paths, layout_fun=layout))
 
         pdf_url = upload_pdf_to_r2(output_path, output_filename)
-
-        return jsonify({
-            "pdf_url": pdf_url,
-            "pages_rendered": len(page_paths),
-        })
+        return {"pdf_url": pdf_url, "pages_rendered": len(page_paths)}
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+def make_cover(template_url, child_name):
+    """Stamps the name on a cover template and uploads it. Returns its details."""
+    job_id = uuid.uuid4().hex[:10]
+    output_filename = f"cover-{job_id}.pdf"
+    output_path = os.path.join("/tmp", output_filename)
+    try:
+        template = fetch_bytes(template_url, timeout=60)
+        details = build_cover_pdf(template, child_name, output_path)
+        cover_url = upload_pdf_to_r2(output_path, output_filename)
+        return {"cover_pdf_url": cover_url, **details}
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+@app.route("/generate-pdf", methods=["POST"])
+def generate_pdf():
+    data = request.get_json()
+
+    if not data or "pages" not in data:
+        return jsonify({"error": "Missing 'pages' in request body"}), 400
+
+    return jsonify(make_interior(data))
 
 
 @app.route("/generate-cover", methods=["POST"])
@@ -456,28 +492,151 @@ def generate_cover():
     if not clean(data.get("childName")):
         return jsonify({"error": "Missing 'childName' in request body"}), 400
 
-    job_id = uuid.uuid4().hex[:10]
-    output_filename = f"cover-{job_id}.pdf"
-    output_path = os.path.join("/tmp", output_filename)
-
     try:
-        template = fetch_bytes(data["coverTemplateUrl"], timeout=60)
-        details = build_cover_pdf(template, data["childName"], output_path)
-        cover_url = upload_pdf_to_r2(output_path, output_filename)
-        return jsonify({"cover_pdf_url": cover_url, **details})
+        return jsonify(make_cover(data["coverTemplateUrl"], data["childName"]))
     except ValueError as e:
         return jsonify({"error": str(e)}), 422
-    finally:
-        if os.path.exists(output_path):
-            os.remove(output_path)
 
 
-@app.route("/download/<filename>", methods=["GET"])
-def download(filename):
-    path = os.path.join("/tmp", filename)
-    if not os.path.exists(path):
-        return jsonify({"error": "File not found — the server may have restarted since it was generated. Re-run /generate-pdf."}), 404
-    return send_file(path, mimetype="application/pdf", as_attachment=True, download_name=filename)
+# --------------------------------------------------------------------
+# /build-book — one whole book, built in the background for Zapier
+# --------------------------------------------------------------------
+# Where the ten printed-cover templates live (Print_Cover_A.pdf ... J).
+COVER_TEMPLATE_BASE = "https://cdn.shopify.com/s/files/1/0827/5850/0600/files/Print_Cover_"
+
+# Page images and cover templates may only come from these addresses,
+# and finished-book messages may only be sent to Zapier.
+ALLOWED_ASSET_PREFIXES = tuple(
+    os.environ.get("ALLOWED_ASSET_PREFIXES", "https://cdn.shopify.com/").split(","))
+ALLOWED_CALLBACK_PREFIXES = tuple(
+    os.environ.get("ALLOWED_CALLBACK_PREFIXES", "https://hooks.zapier.com/").split(","))
+
+# Optional password. When BUILD_SECRET is set on Render, every
+# /build-book request must carry the same value in its "secret" field.
+BUILD_SECRET = os.environ.get("BUILD_SECRET", "")
+
+# Books are built one at a time so a 5-book order can't run the
+# server out of memory; the others wait their turn.
+BUILD_SLOTS = threading.BoundedSemaphore(int(os.environ.get("BUILD_AT_ONCE", "1")))
+
+
+def _field(data, name):
+    return clean(data.get(name)) if data else ""
+
+
+def _short(err):
+    text = " ".join(str(err).split())
+    return text[:300] if text else err.__class__.__name__
+
+
+def post_callback(url, payload, tries=4):
+    """Sends the finished-book message to Zapier, retrying if Zapier is busy."""
+    for attempt in range(tries):
+        try:
+            r = requests.post(url, json=payload, timeout=30)
+            if r.status_code < 500:
+                return r.status_code < 400
+        except requests.RequestException as e:
+            app.logger.warning("Callback attempt %s failed: %s", attempt + 1, e)
+        time.sleep(5 * (attempt + 1))
+    app.logger.error("Gave up sending the finished-book message for %s", payload.get("orderLabel"))
+    return False
+
+
+def run_build(job):
+    result = {
+        "jobId": job["jobId"],
+        "notionPageId": job["notionPageId"],
+        "orderLabel": job["orderLabel"],
+        "childName": job["childName"],
+        "coverId": job["coverId"],
+        "interiorPdfUrl": "",
+        "interiorPages": 0,
+        "coverPdfUrl": "",
+        "status": "ok",
+        "filesNote": "",
+    }
+    notes = []
+    with BUILD_SLOTS:
+        try:
+            interior = make_interior(job["book"])
+            result["interiorPdfUrl"] = interior["pdf_url"]
+            result["interiorPages"] = interior["pages_rendered"]
+        except Exception as e:  # noqa: BLE001 - every failure must reach Notion
+            app.logger.exception("Interior failed for %s", job["orderLabel"])
+            notes.append("Inside pages failed: " + _short(e))
+        try:
+            cover = make_cover(job["coverTemplateUrl"], job["childName"])
+            result["coverPdfUrl"] = cover["cover_pdf_url"]
+        except Exception as e:  # noqa: BLE001
+            app.logger.exception("Cover failed for %s", job["orderLabel"])
+            notes.append("Cover failed: " + _short(e))
+    if notes:
+        result["status"] = "error"
+        result["filesNote"] = " | ".join(notes)
+    post_callback(job["callbackUrl"], result)
+
+
+@app.route("/build-book", methods=["POST"])
+def build_book():
+    data = request.get_json(silent=True)
+    if data is None:
+        data = request.form.to_dict()   # Zapier's "form" payload type
+    problems = []
+
+    if BUILD_SECRET and _field(data, "secret") != BUILD_SECRET:
+        return jsonify({"error": "Wrong or missing 'secret'"}), 403
+
+    # The book itself: the "Pdf Request Body" from the Zap's code step.
+    book = data.get("book") if data else None
+    if isinstance(book, str):
+        try:
+            book = json.loads(book)
+        except ValueError:
+            book = None
+    if not isinstance(book, dict) or not isinstance(book.get("pages"), list) or not book["pages"]:
+        problems.append("'book' is missing or is not the code step's Pdf Request Body")
+        book = {}
+    else:
+        for page in book["pages"]:
+            if not str(page.get("url", "")).startswith(ALLOWED_ASSET_PREFIXES):
+                problems.append("page image not on an allowed address: " + str(page.get("url"))[:120])
+                break
+
+    child_name = _field(data, "childName") or clean(book.get("childName"))
+    if not child_name:
+        problems.append("'childName' is missing")
+
+    cover_url = _field(data, "coverTemplateUrl")
+    cover_id = _field(data, "coverId").upper()
+    if not cover_url:
+        if len(cover_id) == 1 and "A" <= cover_id <= "J":
+            cover_url = f"{COVER_TEMPLATE_BASE}{cover_id}.pdf"
+        else:
+            problems.append(f"'coverId' should be a letter A-J, got '{cover_id}'")
+    if cover_url and not cover_url.startswith(ALLOWED_ASSET_PREFIXES):
+        problems.append("cover template not on an allowed address")
+
+    callback_url = _field(data, "callbackUrl")
+    if not callback_url.startswith(ALLOWED_CALLBACK_PREFIXES):
+        problems.append("'callbackUrl' must be a Zapier catch hook (https://hooks.zapier.com/...)")
+
+    if problems:
+        return jsonify({"error": "; ".join(problems)}), 400
+
+    job = {
+        "jobId": uuid.uuid4().hex[:10],
+        "book": book,
+        "childName": child_name,
+        "coverId": cover_id,
+        "coverTemplateUrl": cover_url,
+        "callbackUrl": callback_url,
+        "notionPageId": _field(data, "notionPageId"),
+        "orderLabel": _field(data, "orderLabel"),
+    }
+    threading.Thread(target=run_build, args=(job,), daemon=True).start()
+    return jsonify({"accepted": True, "jobId": job["jobId"],
+                    "message": "Building in the background; the links will be sent to the callback."}), 202
 
 
 @app.route("/health", methods=["GET"])
