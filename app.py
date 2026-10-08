@@ -1,5 +1,5 @@
 """
-THE SKY THAT MADE YOU — Book PDF Assembly Service (v6)
+THE SKY THAT MADE YOU — Book PDF Assembly Service (v6.1)
 ====================================================================
 Memory-efficient version that uploads the finished PDF to
 Cloudflare R2 for permanent storage, returning a real, public URL.
@@ -42,6 +42,17 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
+# Settings from Render > Environment. Names are matched ignoring stray
+# spaces and upper/lower case, and values are trimmed, so a copy-paste
+# slip (like a space after the name) doesn't silently hide a setting.
+_SETTINGS = {k.strip().upper(): v.strip() for k, v in os.environ.items()}
+
+
+def setting(name, default=""):
+    value = _SETTINGS.get(name.upper(), "")
+    return value if value else default
+
 
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
@@ -514,17 +525,17 @@ COVER_TEMPLATE_BASE = "https://cdn.shopify.com/s/files/1/0827/5850/0600/files/Pr
 # Page images and cover templates may only come from these addresses,
 # and finished-book messages may only be sent to Zapier.
 ALLOWED_ASSET_PREFIXES = tuple(
-    os.environ.get("ALLOWED_ASSET_PREFIXES", "https://cdn.shopify.com/").split(","))
+    setting("ALLOWED_ASSET_PREFIXES", "https://cdn.shopify.com/").split(","))
 ALLOWED_CALLBACK_PREFIXES = tuple(
-    os.environ.get("ALLOWED_CALLBACK_PREFIXES", "https://hooks.zapier.com/").split(","))
+    setting("ALLOWED_CALLBACK_PREFIXES", "https://hooks.zapier.com/").split(","))
 
 # Optional password. When BUILD_SECRET is set on Render, every
 # /build-book request must carry the same value in its "secret" field.
-BUILD_SECRET = os.environ.get("BUILD_SECRET", "")
+BUILD_SECRET = setting("BUILD_SECRET", "")
 
 # Books are built one at a time so a 5-book order can't run the
 # server out of memory; the others wait their turn.
-BUILD_SLOTS = threading.BoundedSemaphore(int(os.environ.get("BUILD_AT_ONCE", "1")))
+BUILD_SLOTS = threading.BoundedSemaphore(int(setting("BUILD_AT_ONCE", "1")))
 
 
 def _field(data, name):
@@ -613,18 +624,18 @@ def run_build(job):
 # LULU_CLIENT_KEY and LULU_CLIENT_SECRET are set. LULU_ENV stays
 # "sandbox" (test orders, never printed or charged) until it is changed
 # to "production".
-LULU_CLIENT_KEY = os.environ.get("LULU_CLIENT_KEY", "")
-LULU_CLIENT_SECRET = os.environ.get("LULU_CLIENT_SECRET", "")
-LULU_ENV = os.environ.get("LULU_ENV", "sandbox").strip().lower()
+LULU_CLIENT_KEY = setting("LULU_CLIENT_KEY", "")
+LULU_CLIENT_SECRET = setting("LULU_CLIENT_SECRET", "")
+LULU_ENV = setting("LULU_ENV", "sandbox").strip().lower()
 LULU_BASE = "https://api.lulu.com" if LULU_ENV == "production" else "https://api.sandbox.lulu.com"
-LULU_POD_PACKAGE_ID = os.environ.get("LULU_POD_PACKAGE_ID", "0850X0850.FC.PRE.CW.080CW444.GXX")
-LULU_CONTACT_EMAIL = os.environ.get("LULU_CONTACT_EMAIL", "hello@theskythatmadeyou.com")
-LULU_DEFAULT_PHONE = os.environ.get("LULU_DEFAULT_PHONE", "")
+LULU_POD_PACKAGE_ID = setting("LULU_POD_PACKAGE_ID", "0850X0850.FC.PRE.CW.080CW444.GXX")
+LULU_CONTACT_EMAIL = setting("LULU_CONTACT_EMAIL", "hello@theskythatmadeyou.com")
+LULU_DEFAULT_PHONE = setting("LULU_DEFAULT_PHONE", "")
 # Minutes Lulu waits before printing, so a job can still be stopped.
-LULU_PRODUCTION_DELAY = int(os.environ.get("LULU_PRODUCTION_DELAY", "1440"))
+LULU_PRODUCTION_DELAY = int(setting("LULU_PRODUCTION_DELAY", "1440"))
 # Shopify shipping option name -> Lulu shipping level.
-LULU_SHIPPING_MAP = json.loads(os.environ.get("LULU_SHIPPING_MAP", '{"Standard": "GROUND"}'))
-LULU_DEFAULT_SHIPPING = os.environ.get("LULU_DEFAULT_SHIPPING", "GROUND")
+LULU_SHIPPING_MAP = json.loads(setting("LULU_SHIPPING_MAP", '{"Standard": "GROUND"}'))
+LULU_DEFAULT_SHIPPING = setting("LULU_DEFAULT_SHIPPING", "GROUND")
 BOOK_TITLE = "The Sky That Made You"
 READY_STATUS = "Signs calculated"
 
@@ -901,6 +912,27 @@ def send_order_route():
     last = books[-1]
     result = send_order(order_name, last.get("ship") or {}, last.get("callbackUrl", ""), force=True)
     return jsonify(result), 200
+
+
+@app.route("/check", methods=["POST"])
+def check_settings():
+    """Shows which settings the service can see, without showing values.
+    Body: {"secret": "..."}"""
+    data = request.get_json(silent=True) or {}
+    if BUILD_SECRET and _field(data, "secret") != BUILD_SECRET:
+        return jsonify({"error": "Wrong or missing 'secret'"}), 403
+    seen = {}
+    for raw_name, value in os.environ.items():
+        if raw_name.strip().upper().startswith(("LULU", "BUILD", "R2_")):
+            seen[repr(raw_name)] = {"length": len(value),
+                                    "has_spaces_around": value != value.strip()}
+    return jsonify({
+        "luluKeysFound": lulu_enabled(),
+        "luluEnvironment": LULU_ENV,
+        "luluAddress": LULU_BASE,
+        "buildSecretSet": bool(BUILD_SECRET),
+        "settingsSeen": seen,
+    })
 
 
 @app.route("/health", methods=["GET"])
